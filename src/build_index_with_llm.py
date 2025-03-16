@@ -252,39 +252,91 @@ def build_topic_tree_from_dir(dir_path: str):
     return topic_tree
 
 
-def search_in_topic_tree(tree, query, model=None):
-    """在主题树中搜索相关内容"""
+def search_in_topic_tree(tree, query_vector, model=None, top_branches=2, base_threshold=0.1, depth_factor=0.05):
+    """
+    利用树的层次结构进行高效检索，使用动态阈值
+    
+    参数:
+        tree: 主题树
+        query: 查询文本
+        model: 嵌入模型
+        top_branches: 每层选择的最相关分支数量
+        base_threshold: 基础相似度阈值
+        depth_factor: 深度影响因子，控制阈值随深度增加的速率
+    
+    返回:
+        按相关度排序的结果列表
+    """ 
     if model is None:
         model = get_embed_model()
+    # 存储所有找到的结果
+    all_results = []
     
-    query_vector = model.encode(query, normalize_embeddings=True)
-    results = []
+    # 缓存节点向量，避免重复计算
+    vector_cache = {}
     
-    def search_recursive(node, path=[]):
-        current_path = path + [node.title]
+    def get_node_vector(title):
+        """获取节点标题的向量表示，带缓存"""
+        if title not in vector_cache:
+            vector_cache[title] = model.encode(title, normalize_embeddings=True)  # 缓存节点向量
+        return vector_cache[title]
+    
+    def search_recursive(node, path=[], depth=0):
+        # 计算动态阈值 - 随深度增加而提高
+        current_threshold = base_threshold + depth * depth_factor
         
-        # 如果是叶子节点，计算相似度
+        current_path = path + [node.title]  # 更新当前路径
+        
+        # 如果是叶子节点，计算相似度并添加到结果
         if node.is_leaf() and node.content:
-            title = node.title
-            title_vector = model.encode(title, normalize_embeddings=True)
-            similarity = np.dot(query_vector, title_vector)
+            title_vector = get_node_vector(node.title)
+            similarity = np.dot(query_vector, title_vector)  # 计算查询向量与节点向量的点积
             
-            results.append({
-                'title': title,
-                'content': node.content,
-                'path': current_path,
-                'score': float(similarity)
-            })
+            # 叶子节点使用较高阈值
+            leaf_threshold = max(current_threshold, 0.4)  # 确保叶子节点至少有0.4的相似度
+            
+            if similarity >= leaf_threshold:
+                all_results.append({
+                    'title': node.title,
+                    'content': node.content,
+                    'path': current_path,
+                    'score': float(similarity)
+                })
+            return
         
-        # 递归搜索子节点
+        # 对于非叶子节点，计算所有子节点与查询的相似度
+        child_similarities = []
         for child in node.children:
-            search_recursive(child, current_path)
+            child_vector = get_node_vector(child.title)
+            similarity = np.dot(query_vector, child_vector)
+            child_similarities.append((child, similarity))
+        
+        # 按相似度降序排序子节点
+        child_similarities.sort(key=lambda x: x[1], reverse=True)
+        
+        # 只遍历相似度最高的前top_branches个分支，且相似度必须高于当前层的阈值
+        selected_branches = 0
+        for child, similarity in child_similarities:
+            if similarity >= current_threshold and selected_branches < top_branches:
+                search_recursive(child, current_path, depth + 1)
+                selected_branches += 1
+            
+            # 即使低于阈值但非常接近顶部结果，也考虑探索（避免边界情况）
+            elif (selected_branches == 0 and 
+                  child_similarities and 
+                  similarity >= current_threshold * 0.8):  # 降低20%的阈值作为容错
+                search_recursive(child, current_path, depth + 1)
+                selected_branches += 1
     
+    # 从根节点开始搜索
     search_recursive(tree)
     
-    # 按相似度排序
-    results.sort(key=lambda x: x['score'], reverse=True)
-    return results[:5]  # 返回前5个最相关的结果
+    # 结果按相似度排序
+    all_results.sort(key=lambda x: x['score'], reverse=True)
+    
+   # 返回前5个最相关结果，每个结果包装在列表中
+    nested_results = [[item] for item in all_results[:5]]
+    return nested_results
 
 
 def save_topic_tree(tree, filename):
